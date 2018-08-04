@@ -4,5 +4,11 @@ module.exports = {
     output: {
         path: __dirname + '/dist',
         filename: 'bundle.js'
+    },
+    resolve: {
+        extensions: [".js", ".jsx"]
+    },
+    devServer: {
+        port: 8001
     }
 };
