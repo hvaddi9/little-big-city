@@ -1,5 +1,5 @@
 /* global mapboxgl */
-import {extrudeGeoJSON} from 'geometry-extrude';
+import {extrudeGeoJSON, extrudePolygon} from 'geometry-extrude';
 import {
     application,
     plugin,
@@ -19,20 +19,21 @@ import JSZip from 'jszip';
 import tessellate from './tessellate';
 import vec2 from 'claygl/src/glmatrix/vec2';
 import PolyBool from 'polybooljs';
-
-const mvtCache = LRU(50);;
-
 import distortion from './distortion';
+
+const mvtCache = LRU(50);
 
 const maptalks = require('maptalks');
 
-let downloading = false;
+const DEFAULT_LNG = -74.0130345;
+const DEFAULT_LAT = 40.7063516;
 
-const config = {
+const DEFAULT_CONFIG = {
     radius: 60,
     curveness: 1,
 
     showEarth: true,
+    earthDepth: 4,
     earthColor: '#c2ebb6',
 
     showBuildings: true,
@@ -41,51 +42,101 @@ const config = {
     showRoads: true,
     roadsColor: '#828282',
 
-    showWater: false,
+    showWater: true,
     waterColor: '#80a9d7',
 
     showCloud: true,
     cloudColor: '#fff',
 
-    autoRotateSpeed: 0,
-    sky: true,
-    downloadOBJ: () => {
-        if (downloading) {
-            return;
+    rotateSpeed: 0,
+    sky: true
+};
+
+const searchStr = location.search.slice(1);
+const searchItems = searchStr.split('&');
+const urlOpts = {};
+searchItems.forEach(item => {
+    const arr = item.split('=');
+    const key = arr[0];
+    const val = arr[1] || true;
+    urlOpts[key] = val;
+});
+urlOpts.lng = urlOpts.lng || DEFAULT_LNG;
+urlOpts.lat = urlOpts.lat || DEFAULT_LAT;
+
+function makeUrl() {
+    const diffConfig = {};
+    for (let key in config) {
+        if (config[key] !== DEFAULT_CONFIG[key]) {
+            diffConfig[key] = config[key];
         }
-        const {obj, mtl} = toOBJ(app.scene, {
-            mtllib: 'city'
-        });
-        const zip = new JSZip();
-        zip.file('city.obj', obj);
-        zip.file('city.mtl', mtl);
-        zip.generateAsync({type: 'blob', compression: 'DEFLATE' })
-            .then(content => {
-                downloading = false;
-                saveAs(content, 'city.zip');
-            }).catch(e => {
-                downloading = false;
-                console.error(e.toString());
+    }
+    urlOpts.config = encodeURIComponent(JSON.stringify(diffConfig));
+
+    const urlItems = [];
+    for (let key in urlOpts) {
+        urlItems.push(key + '=' + urlOpts[key]);
+    }
+    return './?' + urlItems.join('&');
+}
+
+const IS_TILE_STYLE = urlOpts.style === 'tile';
+
+// const TILE_SIZE = IS_TILE_STYLE ? 512 : 256;
+const TILE_SIZE = 256;
+
+const config = Object.assign({}, DEFAULT_CONFIG);
+try {
+    Object.assign(config, JSON.parse(decodeURIComponent(urlOpts.config || '{}')));
+}
+catch (e) {}
+
+const actions = {
+    downloadOBJ: (() => {
+        let downloading = false;
+        return () => {
+            if (downloading) {
+                return;
+            }
+            const {obj, mtl} = toOBJ(app.scene, {
+                mtllib: 'city'
             });
-        // Behind all processing in case some errror happens.
-        downloading = true;
-    },
+            const zip = new JSZip();
+            zip.file('city.obj', obj);
+            zip.file('city.mtl', mtl);
+            zip.generateAsync({type: 'blob', compression: 'DEFLATE' })
+                .then(content => {
+                    downloading = false;
+                    saveAs(content, 'city.zip');
+                }).catch(e => {
+                    downloading = false;
+                    console.error(e.toString());
+                });
+            // Behind all processing in case some errror happens.
+            downloading = true;
+        };
+    })(),
     randomCloud: () => {
         app.methods.generateClouds();
+    },
+    reset: () => {
+        Object.assign(config, DEFAULT_CONFIG);
+        ui.updateDisplay();
+        window.location = makeUrl();
     }
 };
 
-const mvtUrlTpl = 'https://{s}.tile.nextzen.org/tilezen/vector/v1/256/all/{z}/{x}/{y}.mvt?api_key=EWFsMD1DSEysLDWd2hj2cw';
+const mvtUrlTpl = `https://{s}.tile.nextzen.org/tilezen/vector/v1/${TILE_SIZE}/all/{z}/{x}/{y}.mvt?api_key=EWFsMD1DSEysLDWd2hj2cw`;
 
 const mainLayer = new maptalks.TileLayer('base', {
-    tileSize: [256, 256],
+    tileSize: [TILE_SIZE, TILE_SIZE],
     urlTemplate: 'http://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     subdomains: ['a', 'b', 'c']
 });
 const map = new maptalks.Map('map-main', {
-    center: [-0.113049, 51.498568],
+    // center: [-0.113049, 51.498568],
     // center: [-73.97332, 40.76462],
-    // center: [12.910677, 77.629831],
+    center: [urlOpts.lng, urlOpts.lat],
     zoom: 16,
     baseLayer: mainLayer
 });
@@ -190,6 +241,51 @@ function unionComplexPolygons(features) {
     };
 }
 
+function cullBuildingPolygns(features) {
+    const earthCoords = [getRectCoords(earthRect)];
+    features.forEach(feature => {
+        if (feature.geometry && (feature.geometry.type === 'Polygon' || feature.geometry.type === 'MultiPolygon')) {
+            const poly = PolyBool.polygonFromGeoJSON(feature.geometry);
+            const intersectedPoly = PolyBool.intersect(
+                { regions: earthCoords, inverse: false },
+                poly
+            );
+            feature.geometry = PolyBool.polygonToGeoJSON(intersectedPoly);
+            if (!feature.geometry.coordinates.length) {
+                feature.geometry = null;
+            }
+        }
+    });
+}
+
+function unionRect(out, a, b) {
+    const x = Math.min(a.x, b.x);
+    const y = Math.min(a.y, b.y);
+    out.x = x;
+    out.y = y;
+    out.width = Math.max(a.width + a.x, b.width + b.x) - x;
+    out.height = Math.max(a.height + a.y, b.height + b.y) - y;
+}
+
+const width = 55;
+const height = 58.5;
+const earthRect = {
+    x: -width / 2,
+    y: -height / 2,
+    width: width,
+    height: height
+};
+
+function getRectCoords(rect) {
+    return [
+        [rect.x, rect.y],
+        [rect.x + rect.width, rect.y],
+        [rect.x + rect.width, rect.y + rect.height],
+        [rect.x, rect.y + rect.height],
+        [rect.x, rect.y]
+    ];
+}
+
 const app = application.create('#viewport', {
 
     autoRender: false,
@@ -215,7 +311,7 @@ const app = application.create('#viewport', {
                     radius: 5
                 },
                 FXAA: {
-                    enable: true
+                    enable: false
                 }
             }
         });
@@ -224,7 +320,17 @@ const app = application.create('#viewport', {
             blurSize: 3
         });
 
-        const camera = app.createCamera([0, 0, 170], [0, 0, 0]);
+        const camera = app.createCamera([0, 0, 170], [0, 0, 0], IS_TILE_STYLE ? 'ortho' : 'perspective');
+        if (IS_TILE_STYLE) {
+            camera.top = 50;
+            camera.bottom = -50;
+            camera.left = -50 * app.renderer.getViewportAspect();
+            camera.right = 50 * app.renderer.getViewportAspect();
+            camera.near = 0;
+            camera.far = 1000;
+        }
+        camera.update();
+        this._camera = camera;
 
         this._earthNode = app.createNode();
         this._cloudsNode = app.createNode();
@@ -238,6 +344,9 @@ const app = application.create('#viewport', {
 
         vectorElements.forEach(el => {
             this._elementsNodes[el.type] = app.createNode();
+            if (IS_TILE_STYLE) {
+                this._elementsNodes[el.type].rotation.rotateX(-Math.PI / 2);
+            }
             this._elementsMaterials[el.type] = app.createMaterial({
                 diffuseMap: this._diffuseTex,
                 uvRepeat: [10, 10],
@@ -247,12 +356,40 @@ const app = application.create('#viewport', {
             this._elementsMaterials[el.type].name = 'mat_' + el.type;
         });
 
-        app.methods.updateEarthSphere();
+        const light = app.createDirectionalLight([-1, -1, -1], '#fff');
+        light.shadowResolution = 2048;
+        light.shadowBias = IS_TILE_STYLE ? 0.01 : 0.0005;
+
+        this._control = new plugin.OrbitControl({
+            target: camera,
+            domElement: app.container,
+            timeline: app.timeline,
+            rotateSensitivity: 2,
+            orthographicAspect: app.renderer.getViewportAspect()
+        });
+        if (IS_TILE_STYLE) {
+            this._control.setOption({
+                beta: 45,
+                alpha: 30,
+                minAlpha: 10,
+                maxAlpha: 80
+            });
+        }
+        this._control.on('update', () => {
+            this._advRenderer.render();
+        });
+
+        if (!IS_TILE_STYLE) {
+            app.methods.updateEarthSphere();
+        }
         app.methods.updateElements();
         app.methods.updateVisibility();
         app.methods.generateClouds();
 
-        app.createAmbientCubemapLight('./asset/Grand_Canyon_C.hdr', 0.2, 0.8, 1).then(result => {
+        this._advRenderer.render();
+
+
+        return app.createAmbientCubemapLight('./asset/Grand_Canyon_C.hdr', 0.2, 0.8, 1).then(result => {
             const skybox = new plugin.Skybox({
                 environmentMap: result.specular.cubemap,
                 scene: app.scene
@@ -261,20 +398,6 @@ const app = application.create('#viewport', {
             this._skybox = skybox;
             this._advRenderer.render();
         });
-        const light = app.createDirectionalLight([-1, -1, -1], '#fff');
-        light.shadowResolution = 1024;
-        light.shadowBias = 0.0005;
-
-        this._control = new plugin.OrbitControl({
-            target: camera,
-            domElement: app.container,
-            timeline: app.timeline,
-            rotateSensitivity: 2
-        });
-        this._control.on('update', () => {
-            this._advRenderer.render();
-        });
-        this._advRenderer.render();
     },
 
     methods: {
@@ -289,7 +412,7 @@ const app = application.create('#viewport', {
             });
             earthMat.name = 'mat_earth';
 
-            faces.forEach((face, idx) => {
+            faces.forEach(face => {
                 const planeGeo = new builtinGeometries.Plane({
                     widthSegments: 20,
                     heightSegments: 20
@@ -313,6 +436,34 @@ const app = application.create('#viewport', {
             this._advRenderer.render();
         },
 
+        updateEarthGround(app, rect) {
+            this._earthNode.removeAll();
+
+            const {position, uv, normal, indices} = extrudePolygon(
+                [[getRectCoords(earthRect)]], {
+                    depth: config.earthDepth
+                    // bevelSize: 0.3
+                }
+            );
+            const geo = new Geometry();
+            geo.attributes.position.value = position;
+            geo.attributes.normal.value = normal;
+            geo.attributes.texcoord0.value = uv;
+            geo.indices = indices;
+            geo.updateBoundingBox();
+            const mesh = app.createMesh(geo, {
+                nmae: 'mat_earth',
+                roughness: 1,
+                color: config.earthColor,
+                diffuseMap: this._diffuseTex,
+                uvRepeat: [2, 2]
+            }, this._earthNode);
+            mesh.rotation.rotateX(-Math.PI / 2);
+            mesh.position.y = -config.earthDepth + 0.1;
+
+            app.methods.render();
+        },
+
         updateElements(app) {
             this._id = Math.random();
             const advRenderer = this._advRenderer;
@@ -329,19 +480,18 @@ const app = application.create('#viewport', {
 
             function createElementMesh(elConfig, features, boundingRect, idx) {
 
-                if (elConfig.type === 'roads' || elConfig.type === 'water') {
+                if (!IS_TILE_STYLE && elConfig.type === 'roads' || elConfig.type === 'water') {
                     subdivideLongEdges(features, 4);
                 }
                 const result = extrudeGeoJSON({features: features}, {
                     lineWidth: 0.5,
                     excludeBottom: true,
-                    // bevelSize: elConfig.type === 'buildings' ? 0.2: 0,
-                    simplify: elConfig.type === 'buildings' ? 0.01 : 0,
+                    simplify: (IS_TILE_STYLE || elConfig.type === 'buildings') ? 0.01 : 0,
                     depth: elConfig.depth
                 });
                 const poly = result[elConfig.geometryType];
                 const geo = new Geometry();
-                if (elConfig.type === 'water') {
+                if (!IS_TILE_STYLE && elConfig.type === 'water') {
                     const {indices, position} = tessellate(poly.position, poly.indices, 5);
                     poly.indices = indices;
                     poly.position = position;
@@ -351,6 +501,7 @@ const app = application.create('#viewport', {
                 const mesh = app.createMesh(geo, elementsMaterials[elConfig.type], elementsNodes[elConfig.type]);
                 if (elConfig.type === 'buildings') {
                     let positionAnimateFrom = new Float32Array(poly.position);
+                    let positionAnimateTo = poly.position;
                     for (let i = 0; i < positionAnimateFrom.length; i += 3) {
                         const z = positionAnimateFrom[i + 2];
                         if (z > 0) {
@@ -358,12 +509,14 @@ const app = application.create('#viewport', {
                         }
                     }
 
-                    let positionAnimateTo = distortion(
-                        poly.position, boundingRect, config.radius, config.curveness, faces[idx]
-                    );
-                    positionAnimateFrom = distortion(
-                        positionAnimateFrom, boundingRect, config.radius, config.curveness, faces[idx]
-                    );
+                    if (!IS_TILE_STYLE) {
+                        positionAnimateTo = distortion(
+                            poly.position, boundingRect, config.radius, config.curveness, faces[idx]
+                        );
+                        positionAnimateFrom = distortion(
+                            positionAnimateFrom, boundingRect, config.radius, config.curveness, faces[idx]
+                        );
+                    }
                     geo.attributes.position.value = positionAnimateTo;
                     geo.generateVertexNormals();
                     geo.updateBoundingBox();
@@ -393,36 +546,55 @@ const app = application.create('#viewport', {
                         .start('elasticOut');
                 }
                 else {
-                    geo.attributes.position.value = distortion(
-                        poly.position, boundingRect,
-                        config.radius, config.curveness, faces[idx]
-                    );
+                    if (IS_TILE_STYLE) {
+                        geo.attributes.position.value = poly.position;
+                    }
+                    else {
+                        geo.attributes.position.value = distortion(
+                            poly.position, boundingRect,
+                            config.radius, config.curveness, faces[idx]
+                        );
+                    }
                     geo.generateVertexNormals();
                     geo.updateBoundingBox();
-
-                    if (elConfig.type === 'water') {
-                        // mesh.culling = false;
-                        // mesh.material.define('fragment', 'DOUBLE_SIDED');
-                        // geo.generateBarycentric();
-                        // mesh.material.set('lineWidth', 1);
-                    }
                 }
+
+                return {boundingRect: poly.boundingRect};
             }
 
-            const tiles = mainLayer.getTiles();
+            let tiles = mainLayer.getTiles().tileGrids[0].tiles;
             const subdomains = ['a', 'b', 'c'];
-            tiles.tileGrids[0].tiles.forEach((tile, idx) => {
+            if (IS_TILE_STYLE) {
+                const center = map.getCenter();
+                tiles = tiles.filter(tile => {
+                    const extent = tile.extent2d.convertTo(c => map.pointToCoord(c)).toJSON();
+                    return extent.xmax > center.x && extent.xmin < center.x
+                        && extent.ymax > center.y && extent.ymin < center.y;
+                });
+            }
+            let loading = Math.min(tiles.length, 6);
+            tiles.forEach((tile, idx) => {
                 const fetchId = this._id;
                 if (idx >= 6) {
                     return;
                 }
-
                 const extent = tile.extent2d.convertTo(c => map.pointToCoord(c)).toJSON();
-                const scale = 1e4;
-                const boundingRect = {
-                    x: 0, y: 0,
-                    width: (extent.xmax - extent.xmin) * scale,
-                    height: (extent.ymax - extent.ymin) * scale
+
+                const scaleX = 1e4;
+                const scaleY = scaleX * 1.4;
+                const width = (extent.xmax - extent.xmin) * scaleX;
+                const height = (extent.ymax - extent.ymin) * scaleY;
+                const tileRect = {
+                    x: IS_TILE_STYLE ? -width / 2 : 0,
+                    y: IS_TILE_STYLE ? -height / 2 : 0,
+                    width: width,
+                    height: height
+                };
+                const allBoundingRect = {
+                    x: Infinity,
+                    y: Infinity,
+                    width: -Infinity,
+                    height: -Infinity
                 };
 
                 const url = mvtUrlTpl.replace('{z}', tile.z)
@@ -463,8 +635,17 @@ const app = application.create('#viewport', {
                             features[type] = [];
                             for (let i = 0; i < vTile.layers[type].length; i++) {
                                 const feature = vTile.layers[type].feature(i).toGeoJSON(tile.x, tile.y, tile.z);
-                                scaleFeature(feature, [-extent.xmin, -extent.ymin], [scale, scale]);
+                                scaleFeature(
+                                    feature, IS_TILE_STYLE
+                                        ? [-(extent.xmax + extent.xmin) / 2, -(extent.ymax + extent.ymin) / 2]
+                                        : [-extent.xmin, -extent.ymin]
+                                    , [scaleX, scaleY]
+                                );
                                 features[type].push(feature);
+                            }
+
+                            if (IS_TILE_STYLE) {
+                                cullBuildingPolygns(features[type]);
                             }
                         });
 
@@ -481,11 +662,19 @@ const app = application.create('#viewport', {
 
                         mvtCache.set(url, features);
                         for (let key in features) {
-                            createElementMesh(
+                            const {boundingRect} = createElementMesh(
                                 vectorElements.find(config => config.type === key),
                                 features[key],
-                                boundingRect, idx
+                                tileRect, idx
                             );
+                            unionRect(allBoundingRect, boundingRect, allBoundingRect);
+                        }
+
+                        loading--;
+                        if (IS_TILE_STYLE) {
+                            if (loading === 0) {
+                                app.methods.updateEarthGround(allBoundingRect);
+                            }
                         }
 
                         app.methods.render();
@@ -494,12 +683,13 @@ const app = application.create('#viewport', {
         },
 
         generateClouds(app) {
-            const cloudNumber = 15;
+            const cloudNumber = IS_TILE_STYLE ? 10 : 15;
             const pointCount = 100;
             this._cloudsNode.removeAll();
 
             const cloudMaterial = app.createMaterial({
-                roughness: 1
+                roughness: 1,
+                color: config.cloudColor
             });
             cloudMaterial.name = 'mat_cloud';
 
@@ -535,8 +725,14 @@ const app = application.create('#viewport', {
                         const pt = randomInSphere(r);
                         points.push(pt);
                         positionArr[off++] = pt[0] + posOff * dist * dx;
-                        positionArr[off++] = pt[1] + posOff * dist * dy;
-                        positionArr[off++] = pt[2];
+                        if (IS_TILE_STYLE) {
+                            positionArr[off++] = pt[1];
+                            positionArr[off++] = pt[2] + posOff * dist * dy;
+                        }
+                        else {
+                            positionArr[off++] = pt[1] + posOff * dist * dy;
+                            positionArr[off++] = pt[2];
+                        }
                     }
                     const tmp = quickhull(points);
                     for (let m = 0; m < tmp.length; m++) {
@@ -553,8 +749,20 @@ const app = application.create('#viewport', {
 
                 const cloudMesh = app.createMesh(geo, cloudMaterial, this._cloudsNode);
                 cloudMesh.height = Math.random() * 10 + 20;
-                cloudMesh.position.setArray(randomInSphere(config.radius / Math.sqrt(2) + cloudMesh.height));
-                cloudMesh.lookAt(Vector3.ZERO);
+                if (IS_TILE_STYLE) {
+                    cloudMesh.position.setArray([
+                        (Math.random() - 0.5) * 60,
+                        Math.random() * 10 + 25,
+                        (Math.random() - 0.5) * 60
+                    ]);
+                    if (IS_TILE_STYLE) {
+                        cloudMesh.scale.set(0.6, 0.6, 0.6);
+                    }
+                }
+                else {
+                    cloudMesh.position.setArray(randomInSphere(config.radius / Math.sqrt(2) + cloudMesh.height));
+                    cloudMesh.lookAt(Vector3.ZERO);
+                }
             }
             app.methods.render();
         },
@@ -573,15 +781,17 @@ const app = application.create('#viewport', {
         },
 
         render(app) {
+            this._control.orthographicAspect = app.renderer.getViewportAspect();
             this._advRenderer.render();
+            // TODO
             setTimeout(() => {
                 this._advRenderer.render();
             }, 20);
         },
 
         updateAutoRotate() {
-            this._control.autoRotateSpeed = config.autoRotateSpeed * 50;
-            this._control.autoRotate = Math.abs(config.autoRotateSpeed) > 0.3;
+            this._control.rotateSpeed = config.rotateSpeed * 50;
+            this._control.autoRotate = Math.abs(config.rotateSpeed) > 0.3;
         },
 
         updateSky(app) {
@@ -603,8 +813,14 @@ const app = application.create('#viewport', {
 });
 
 function updateAll() {
-    app.methods.updateEarthSphere();
+    if (!IS_TILE_STYLE) {
+        app.methods.updateEarthSphere();
+    }
     app.methods.updateElements();
+}
+
+function updateUrlState() {
+    history.pushState('', '', makeUrl());
 }
 
 let timeout;
@@ -612,7 +828,13 @@ map.on('moveend', function () {
     clearTimeout(timeout);
     timeout = setTimeout(function () {
         app.methods.updateElements();
+        updateUrlState();
     }, 500);
+});
+map.on('moving', function () {
+    const center = map.getCenter();
+    urlOpts.lng = document.querySelector('#lng').value = center.x;
+    urlOpts.lat = document.querySelector('#lat').value = center.y;
 });
 map.on('zoomend', function () {
     clearTimeout(timeout);
@@ -621,32 +843,61 @@ map.on('zoomend', function () {
     }, 500);
 });
 
+Array.prototype.forEach.call(document.querySelectorAll('#style-list li'), li => {
+    li.addEventListener('click', () => {
+        urlOpts.style = li.className;
+        window.location = makeUrl();
+    });
+});
+
+document.querySelector('#locate').addEventListener('click', () => {
+    urlOpts.lng = +document.querySelector('#lng').value;
+    urlOpts.lat = +document.querySelector('#lat').value;
+    map.setCenter({x: urlOpts.lng, y: urlOpts.lat});
+    app.methods.updateElements();
+    updateUrlState();
+});
+
+document.querySelector('#reset').addEventListener('click', () => {
+    urlOpts.lng = document.querySelector('#lng').value = DEFAULT_LNG;
+    urlOpts.lat = document.querySelector('#lat').value = DEFAULT_LAT;
+    map.setCenter({x: urlOpts.lng, y: urlOpts.lat});
+    app.methods.updateElements();
+    updateUrlState();
+});
+
 const ui = new dat.GUI();
-ui.add(config, 'radius', 30, 100).step(1).onChange(updateAll);
-ui.add(config, 'autoRotateSpeed', -2, 2).step(0.01).onChange(app.methods.updateAutoRotate);
-ui.add(config, 'sky').onChange(app.methods.updateSky);
+ui.add(actions, 'reset');
+if (!IS_TILE_STYLE) {
+    ui.add(config, 'radius', 30, 100).step(1).onChange(updateAll).onFinishChange(updateUrlState);
+}
+ui.add(config, 'rotateSpeed', -2, 2).step(0.01).onChange(app.methods.updateAutoRotate).onFinishChange(updateUrlState);
+ui.add(config, 'sky').onChange(app.methods.updateSky).onFinishChange(updateUrlState);
 
 const earthFolder = ui.addFolder('Earth');
-earthFolder.add(config, 'showEarth').onChange(app.methods.updateVisibility);
-earthFolder.addColor(config, 'earthColor').onChange(app.methods.updateColor);
+earthFolder.add(config, 'showEarth').onChange(app.methods.updateVisibility).onFinishChange(updateUrlState);
+if (IS_TILE_STYLE) {
+    earthFolder.add(config, 'earthDepth', 1, 50).onChange(app.methods.updateEarthGround).onFinishChange(updateUrlState);
+}
+earthFolder.addColor(config, 'earthColor').onChange(app.methods.updateColor).onFinishChange(updateUrlState);
 
 const buildingsFolder = ui.addFolder('Buildings');
-buildingsFolder.add(config, 'showBuildings').onChange(app.methods.updateVisibility);
-buildingsFolder.addColor(config, 'buildingsColor').onChange(app.methods.updateColor);
+buildingsFolder.add(config, 'showBuildings').onChange(app.methods.updateVisibility).onFinishChange(updateUrlState);
+buildingsFolder.addColor(config, 'buildingsColor').onChange(app.methods.updateColor).onFinishChange(updateUrlState);
 
 const roadsFolder = ui.addFolder('Roads');
-roadsFolder.add(config, 'showRoads').onChange(app.methods.updateVisibility);
-roadsFolder.addColor(config, 'roadsColor').onChange(app.methods.updateColor);
+roadsFolder.add(config, 'showRoads').onChange(app.methods.updateVisibility).onFinishChange(updateUrlState);
+roadsFolder.addColor(config, 'roadsColor').onChange(app.methods.updateColor).onFinishChange(updateUrlState);
 
 const waterFolder = ui.addFolder('Water');
-waterFolder.add(config, 'showWater').onChange(app.methods.updateVisibility);
-waterFolder.addColor(config, 'waterColor').onChange(app.methods.updateColor);
+waterFolder.add(config, 'showWater').onChange(app.methods.updateVisibility).onFinishChange(updateUrlState);
+waterFolder.addColor(config, 'waterColor').onChange(app.methods.updateColor).onFinishChange(updateUrlState);
 
 const cloudFolder = ui.addFolder('Cloud');
-cloudFolder.add(config, 'showCloud').onChange(app.methods.updateVisibility);
-cloudFolder.addColor(config, 'cloudColor').onChange(app.methods.updateColor);
-cloudFolder.add(config, 'randomCloud');
+cloudFolder.add(config, 'showCloud').onChange(app.methods.updateVisibility).onFinishChange(updateUrlState);
+cloudFolder.addColor(config, 'cloudColor').onChange(app.methods.updateColor).onFinishChange(updateUrlState);
+cloudFolder.add(actions, 'randomCloud');
 
-ui.add(config, 'downloadOBJ');
+ui.add(actions, 'downloadOBJ');
 
 window.addEventListener('resize', () => { app.resize(); app.methods.render(); });
